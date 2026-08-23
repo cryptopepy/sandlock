@@ -418,6 +418,19 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
         let regs = ptrace_getregs(pid).map_err(|e| {
             SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
         })?;
+        // riscv64 cannot re-arm an interrupted restartable syscall at restore
+        // time (`orig_a0` is not ptrace-exposed), so refuse the checkpoint now
+        // while the tell-tale sentinel is still in `a0`. This saves the memory
+        // dump and surfaces the error at the actionable moment.
+        #[cfg(target_arch = "riscv64")]
+        if let Some(sentinel) = super::restore_blob::restart_sentinel_in_a0(&regs) {
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                "checkpoint captured an interrupted restartable syscall \
+                 (a0 = {sentinel}); riscv64 cannot recover its original argument, \
+                 so restore would resume with a corrupt return value — retry \
+                 while the workload is not blocked in a syscall"
+            ))));
+        }
         // FP state is best-effort: an image without it still restores.
         let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
         let maps =

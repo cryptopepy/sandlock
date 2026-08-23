@@ -8,14 +8,17 @@ fn main() {
 
     // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It
     // lives in tests/ and its binary sits beside it (a git-ignored artifact).
-    build_static(
+    if !build_static(
         &repo_root.join("tests/rootfs-helper.c"),
         &repo_root.join("tests/rootfs-helper"),
         &["musl-gcc", "cc"],
         &["-static", "-O2"],
-        "cannot compile tests/rootfs-helper: chroot tests will fail. \
-         Install musl-tools or static libc.",
-    );
+    ) {
+        println!(
+            "cargo:warning=cannot compile tests/rootfs-helper: chroot tests will \
+             fail. Install musl-tools or static libc."
+        );
+    }
 
     // restore-stub: a core component of the restore engine (the supervisor execs
     // it to reconstruct a checkpoint), freestanding, no libc, no PIE. It lives
@@ -27,46 +30,87 @@ fn main() {
     // text and stack have to sit outside the address range programs occupy. The
     // default -no-pie base (0x400000) is exactly where a static ET_EXEC workload
     // loads, so the checkpoint's own text would be mapped over the running stub.
+    //
+    // Cross-compilation: when TARGET is riscv64gc-unknown-linux-gnu (or any
+    // riscv64* variant), look for a riscv64 cross-compiler. On the host it
+    // uses plain `cc` as before.
     let stub_src = manifest_dir.join("src/checkpoint/restore-stub.c");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let stub_bin = out_dir.join("restore-stub");
-    build_static(
+    let host = std::env::var("HOST").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_riscv64 = target.starts_with("riscv64");
+    // Checkpoint restore is claimed only on x86_64 and riscv64 (see
+    // `restore_interactive`); on those arches a stub build failure is fatal, not
+    // a silent skip — a green build with no stub is how regressions slip past CI.
+    let is_restore_arch = target.starts_with("x86_64") || is_riscv64;
+    let (ccs, fail_msg) = if is_riscv64 {
+        if host.starts_with("riscv64") {
+            (
+                &["cc", "riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+                "failed to compile restore-stub for riscv64: no working C compiler \
+                 (install gcc); checkpoint restore is unavailable",
+            )
+        } else {
+            (
+                &["riscv64-linux-gnu-gcc", "riscv64-unknown-linux-gnu-gcc"][..],
+                "failed to compile restore-stub for riscv64: no working cross-compiler \
+                 (install riscv64-linux-gnu-gcc); checkpoint restore is unavailable",
+            )
+        }
+    } else {
+        (
+            &["cc"][..],
+            "failed to compile restore-stub: no working C compiler \
+             (install cc/gcc); checkpoint restore is unavailable",
+        )
+    };
+    // The link address must match restore_blob::STUB_BASE and must sit below
+    // the Sv39 user ceiling (256 GiB) on riscv64.  x86_64 uses 0x300_0000_0000.
+    let text_segment = if is_riscv64 {
+        "-Wl,-Ttext-segment=0x3000000000"
+    } else {
+        "-Wl,-Ttext-segment=0x30000000000"
+    };
+    if !build_static(
         &stub_src,
         &stub_bin,
-        &["cc"],
+        ccs,
         &[
             "-static",
             "-nostdlib",
             "-no-pie",
             "-O2",
-            // Without these, loop-idiom recognition rewrites the stub's own
-            // hand-written memset/memcpy bodies into calls to memset/memcpy,
-            // i.e. into infinite self-recursion. There is no libc to fall back
-            // on, so the stub must keep its byte loops as byte loops.
             "-ffreestanding",
             "-fno-tree-loop-distribute-patterns",
-            "-Wl,-Ttext-segment=0x30000000000",
+            text_segment,
         ],
-        "cannot compile restore-stub: its restore tests will be skipped.",
-    );
+    ) {
+        if is_restore_arch {
+            panic!("{fail_msg}");
+        }
+        println!("cargo:warning={fail_msg}");
+    }
     // Emit the path every run (rustc-env is not cached across build-script runs),
     // whether or not the binary was just (re)built.
     println!("cargo:rustc-env=RESTORE_STUB_PATH={}", stub_bin.display());
 }
 
 /// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the
-/// work when `bin` is newer than `src`. Emits `warn` (as a cargo warning) if no
-/// compiler succeeds. A missing source is silently skipped (packaged crate).
-fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str], warn: &str) {
+/// work when `bin` is newer than `src`. Returns `false` only when the source is
+/// present, newer than `bin`, and no compiler in `ccs` succeeded; a missing
+/// source (a packaged crate) or an up-to-date `bin` reports success. The caller
+/// decides whether that failure is a hard error or a warning.
+fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
     println!("cargo:rerun-if-changed={}", src.display());
     if !src.exists() {
-        return;
+        return true;
     }
     if bin.exists() {
         if let (Ok(s), Ok(b)) = (src.metadata(), bin.metadata()) {
             if let (Ok(st), Ok(bt)) = (s.modified(), b.modified()) {
                 if bt >= st {
-                    return;
+                    return true;
                 }
             }
         }
@@ -81,8 +125,8 @@ fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str], warn: &str)
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
-            return;
+            return true;
         }
     }
-    println!("cargo:warning={warn}");
+    false
 }

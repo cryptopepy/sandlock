@@ -42,7 +42,15 @@ const SRC_FILE: u8 = 1;
 /// through the stub, because the stub's own text would be clobbered while it
 /// runs (this is exactly the collision a `-no-pie` stub at the default 0x400000
 /// hits against any static `ET_EXEC` workload).
+///
+/// x86_64 uses 3 TiB, far above any ordinary user address space.  riscv64 must
+/// stay below the Sv39 ceiling of 256 GiB.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const STUB_BASE: u64 = 0x300_0000_0000;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const STUB_BASE: u64 = 0x30_0000_0000;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+pub(crate) const STUB_BASE: u64 = 0;
 pub(crate) const STUB_SPAN: u64 = 0x40_0000;
 
 /// x86_64 signal-frame FP image constants. `FP_XSTATE_MAGIC1` in the
@@ -98,12 +106,15 @@ pub(crate) struct RestorePlan {
 /// whether a mapping falls inside one recorded range would call that merged VMA
 /// a stray and unmap the restored program's own memory.
 pub(crate) fn plan_sweep(current: &[MemoryMap], cp: &[MemoryMap]) -> Vec<(u64, u64)> {
-    // Keep set: every recorded region plus the stub's reserved window, merged
-    // into disjoint ascending intervals.
+    let base: Vec<(u64, u64)> = if STUB_BASE > 0 {
+        vec![(STUB_BASE, STUB_BASE + STUB_SPAN)]
+    } else {
+        Vec::new()
+    };
     let mut keep: Vec<(u64, u64)> = cp
         .iter()
         .map(|m| (m.start, m.end))
-        .chain(std::iter::once((STUB_BASE, STUB_BASE + STUB_SPAN)))
+        .chain(base)
         .filter(|(lo, hi)| lo < hi)
         .collect();
     keep.sort_unstable();
@@ -342,36 +353,82 @@ fn to_child_path(
     }
 }
 
+/// The kernel's restart sentinels for an aborted restartable syscall:
+/// -ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND / -ERESTART_RESTARTBLOCK.
+/// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "riscv64")),
+    allow(dead_code)
+)]
+fn is_restart_sentinel(v: i64) -> bool {
+    matches!(v, -512 | -513 | -514 | -516)
+}
+
+/// Return the restart sentinel a riscv64 register file holds in `a0`, if any.
+///
+/// On riscv64 `a0` is both the first syscall argument and the return value, so
+/// an aborted restartable syscall overwrites the original argument with the
+/// sentinel. The original (`orig_a0`) is not part of the ptrace-exposed
+/// `user_regs_struct`, so neither capture nor restore can recover it. Callers
+/// reject the checkpoint rather than resume with a corrupt return value.
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn restart_sentinel_in_a0(regs: &[u64]) -> Option<i64> {
+    // riscv64 user_regs_struct order: pc, ra, sp, gp, tp, t0-t2, s0-s1,
+    // a0-a7, s2-s11, t3-t6 — so a0 is index 10.
+    const A0: usize = 10;
+    let a0 = *regs.get(A0)? as i64;
+    if is_restart_sentinel(a0) { Some(a0) } else { None }
+}
+
 /// Re-arm an interrupted, restartable syscall in the saved register file.
 ///
 /// When the checkpoint was taken (via `PTRACE_INTERRUPT`) while the process sat
-/// in a syscall, the kernel aborted it with a restart sentinel in rax
-/// (-ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND / -ERESTART_RESTARTBLOCK).
-/// At the ptrace stop, rip still points just PAST the `syscall` instruction. The
-/// kernel's restart fixup (rewind rip onto the 2-byte `syscall`, reload rax with
-/// the original syscall number) normally runs on the syscall-return path, which a
-/// restore bypasses. Without it, userspace resumes one instruction past the
-/// syscall with the raw sentinel (e.g. -514) in rax and faults. Applying the
-/// fixup here re-executes the syscall cleanly with its arguments still in
-/// registers (this is what CRIU does).
+/// in a syscall, the kernel aborted it with a restart sentinel in the return
+/// register. At the ptrace stop the PC still points just PAST the syscall
+/// instruction. The kernel's restart fixup (rewind PC, reload the return
+/// register with the original syscall number) normally runs on the
+/// syscall-return path, which a restore bypasses. Without it, userspace resumes
+/// one instruction past the syscall with the raw sentinel (e.g. -514) in the
+/// return register and faults. Applying the fixup here re-executes the syscall
+/// cleanly with its arguments still in registers (this is what CRIU does).
 ///
-/// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched. For
-/// ERESTART_RESTARTBLOCK (-516) the original syscall is re-run rather than the
-/// kernel's `restart_syscall` path (restart_block is not captured), so
+/// For ERESTART_RESTARTBLOCK (-516) the original syscall is re-run rather than
+/// the kernel's `restart_syscall` path (restart_block is not captured), so
 /// timeout-bearing syscalls restart with their full original timeout: an
 /// accepted approximation for fresh-process restore.
 #[cfg(target_arch = "x86_64")]
-fn rearm_restartable_syscall(regs: &mut [u64]) {
+fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
     // x86_64 user_regs_struct layout indices.
     const RAX: usize = 10;
     const ORIG_RAX: usize = 15;
     const RIP: usize = 16;
     if let (Some(&rax), Some(&orig_rax)) = (regs.get(RAX), regs.get(ORIG_RAX)) {
-        if matches!(rax as i64, -512 | -513 | -514 | -516) {
+        if is_restart_sentinel(rax as i64) {
             regs[RAX] = orig_rax;
             regs[RIP] = regs[RIP].wrapping_sub(2);
         }
     }
+    Ok(())
+}
+
+/// riscv64 re-arm is deliberately not implemented (see `restart_sentinel_in_a0`):
+/// a correct restart needs the original `a0` argument, which ptrace does not
+/// expose. On kernels ≥ 6.6 the kernel has already applied the restart fixup
+/// before the ptrace stop, so `a0` is the original argument and this check is a
+/// no-op. On older kernels the sentinel is visible here, and rejecting is the
+/// only safe answer — resuming would hand userspace a raw `-ERESTART*` as the
+/// syscall result.
+#[cfg(target_arch = "riscv64")]
+fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
+    if let Some(sentinel) = restart_sentinel_in_a0(regs) {
+        return Err(format!(
+            "checkpoint captured an interrupted restartable syscall \
+             (a0 = {sentinel}); riscv64 cannot recover its original argument, \
+             so restore would resume with a corrupt return value. Retry the \
+             checkpoint while the workload is not blocked in a syscall"
+        ));
+    }
+    Ok(())
 }
 
 /// Build the FP image the stub points the signal frame's `fpstate` at.
@@ -440,13 +497,29 @@ fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
     img
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// Build the FP image for the riscv64 signal frame. Unlike x86_64, riscv64 has
+/// no xstate/magic framing — the kernel stores the FPU context inline in
+/// `uc.uc_mcontext.__fpregs` as a raw `struct __riscv_d_ext_state` (or
+/// `__riscv_f_ext_state` for single-precision). The stub copies it verbatim into
+/// the ucontext's fp slot; the kernel reads it back from the signal frame on
+/// rt_sigreturn.
+#[cfg(target_arch = "riscv64")]
+fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
+    if fpregs.is_empty() {
+        return Vec::new();
+    }
+    fpregs.to_vec()
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 fn build_fpstate_image(_fpregs: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn rearm_restartable_syscall(_regs: &mut [u64]) {}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+fn rearm_restartable_syscall(_regs: &mut [u64]) -> Result<(), String> {
+    Ok(())
+}
 
 /// Interns NUL-terminated strings into the blob's string table, deduplicating
 /// repeats (a multi-segment ELF mapping names the same file once per segment).
@@ -485,24 +558,24 @@ pub(crate) fn plan(
     let regions = build_memory_plan(&ps.memory_maps, &ps.memory_data);
 
     // The stub's own text/data/bss/stack live at a fixed far base. A checkpoint
-    // that occupies that window would have its region mapped over the running
-    // stub, so refuse rather than crash mid-restore.
-    if let Some(r) = regions
-        .iter()
-        .find(|r| r.start() < STUB_BASE + STUB_SPAN && STUB_BASE < r.end())
-    {
-        return Err(format!(
-            "checkpoint region {:#x}-{:#x} overlaps the restore-stub's reserved \
-             window {:#x}-{:#x}",
-            r.start(), r.end(), STUB_BASE, STUB_BASE + STUB_SPAN,
-        ));
+    if STUB_BASE > 0 {
+        if let Some(r) = regions
+            .iter()
+            .find(|r| r.start() < STUB_BASE + STUB_SPAN && STUB_BASE < r.end())
+        {
+            return Err(format!(
+                "checkpoint region {:#x}-{:#x} overlaps the restore-stub's reserved \
+                 window {:#x}-{:#x}",
+                r.start(), r.end(), STUB_BASE, STUB_BASE + STUB_SPAN,
+            ));
+        }
     }
 
     let (restorable_fds, skipped) = build_fd_plan(&cp.fd_table);
     let vdso = plan_vdso_moves(&ps.memory_maps);
 
     let mut regs = ps.regs.clone();
-    rearm_restartable_syscall(&mut regs);
+    rearm_restartable_syscall(&mut regs)?;
     let fpstate = build_fpstate_image(&ps.fpregs);
 
     let mut strings = StringTable::default();
@@ -593,6 +666,35 @@ mod tests {
 
     fn map(start: u64, end: u64, path: Option<&str>) -> MemoryMap {
         MemoryMap { start, end, perms: "rw-p".into(), offset: 0, path: path.map(Into::into) }
+    }
+
+    #[test]
+    fn restart_sentinel_matches_only_restart_codes() {
+        assert!(is_restart_sentinel(-512)); // ERESTARTSYS
+        assert!(is_restart_sentinel(-513)); // ERESTARTNOINTR
+        assert!(is_restart_sentinel(-514)); // ERESTARTNOHAND
+        assert!(is_restart_sentinel(-516)); // ERESTART_RESTARTBLOCK
+        assert!(!is_restart_sentinel(-515)); // ENOIOCTLCMD, not a restart code
+        assert!(!is_restart_sentinel(0));
+        assert!(!is_restart_sentinel(-1)); // EPERM
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn riscv64_rearm_rejects_an_in_flight_restartable_syscall() {
+        // riscv64 user_regs_struct order: a0 is index 10.
+        let mut regs = vec![0u64; 32];
+
+        regs[10] = (-514i64) as u64; // ERESTARTNOHAND
+        let err = rearm_restartable_syscall(&mut regs)
+            .expect_err("a restart sentinel in a0 must be rejected");
+        assert!(err.contains("restartable"), "names the cause: {err}");
+
+        regs[10] = (-515i64) as u64; // ENOIOCTLCMD is not a restart code
+        rearm_restartable_syscall(&mut regs).expect("ENOIOCTLCMD must not be rejected");
+
+        regs[10] = 7; // ordinary return value
+        rearm_restartable_syscall(&mut regs).expect("a normal return value passes");
     }
 
     #[test]
@@ -692,6 +794,7 @@ mod tests {
         assert!(verify_special_mappings(&current, &cp).is_ok());
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[test]
     fn sweep_removes_a_leftover_stack_but_spares_the_image_and_the_stub() {
         // The layout the stub is in at READY: the checkpoint's regions, the
@@ -837,7 +940,7 @@ mod tests {
         let strings_len = u32::from_le_bytes(blob[48..52].try_into().unwrap()) as usize;
         assert_eq!(&blob[strings_off..strings_off + strings_len], b"/bin/app\0");
     }
-
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     #[test]
     fn plan_rejects_a_checkpoint_overlapping_the_stub_window() {
         let cp = tiny_checkpoint(
@@ -860,7 +963,7 @@ mod tests {
         regs[10] = (-514i64) as u64; // rax
         regs[15] = 34;               // orig_rax
         regs[16] = 0x4010_0000;      // rip, just past the `syscall`
-        rearm_restartable_syscall(&mut regs);
+        rearm_restartable_syscall(&mut regs).unwrap();
         assert_eq!(regs[10], 34, "rax reloaded with the original syscall number");
         assert_eq!(regs[16], 0x4010_0000 - 2, "rip rewound onto the 2-byte syscall");
     }
@@ -873,10 +976,14 @@ mod tests {
         regs[10] = (-515i64) as u64;
         regs[15] = 34;
         regs[16] = 0x4010_0000;
-        rearm_restartable_syscall(&mut regs);
+        rearm_restartable_syscall(&mut regs).unwrap();
         assert_eq!(regs[10], (-515i64) as u64);
         assert_eq!(regs[16], 0x4010_0000);
     }
+
+    // riscv64 has no re-arm to test: it rejects a restart sentinel instead (see
+    // `riscv64_rearm_rejects_an_in_flight_restartable_syscall` above), so only
+    // x86_64 exercises the rewind here.
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -928,6 +1035,19 @@ mod tests {
         let img = build_fpstate_image(&vec![0xFFu8; 512]);
         assert_eq!(img.len(), 512);
         assert!(img[464..512].iter().all(|&b| b == 0), "sw_reserved cleared");
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn fpstate_image_passes_through_raw_fpregs() {
+        // riscv64 has no xstate framing: the kernel stores
+        // __riscv_d_ext_state directly in sc_fpregs. build_fpstate_image
+        // returns the capture verbatim so the stub copies it as-is into the
+        // ucontext's fp slot.
+        let fp = vec![0xA5u8; 264];
+        let img = build_fpstate_image(&fp);
+        assert_eq!(img, fp, "riscv64 fpstate is a raw passthrough");
+        assert_eq!(img.len(), 264);
     }
 
     #[test]

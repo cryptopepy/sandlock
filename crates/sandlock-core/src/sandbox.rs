@@ -1072,7 +1072,10 @@ impl Sandbox {
     /// [`Sandbox::popen`], the returned [`Process`] is the handle to it (no
     /// `start()` step). Fds that could not be transparently recreated are
     /// recorded on this `Sandbox`; query them with [`Sandbox::restore_skipped`].
-    /// x86_64 restore engine only.
+    /// x86_64 and riscv64 restore engines supported. A riscv64 checkpoint taken
+    /// while the process was blocked in a restartable syscall (nanosleep, futex,
+    /// read, ...) is rejected: its original first argument is not recoverable
+    /// from the register file, so that resume cannot be made correct.
     ///
     /// The kernel vDSO is relocated onto the checkpoint-recorded base during
     /// restore, so ordinary libc/glibc programs that call vDSO functions (e.g.
@@ -1087,9 +1090,9 @@ impl Sandbox {
         use crate::checkpoint::{restore_blob, resume};
         use crate::error::SandboxRuntimeError;
 
-        if cfg!(not(target_arch = "x86_64")) {
+        if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
             return Err(SandboxRuntimeError::Child(
-                "checkpoint restore is only implemented on x86_64".into(),
+                "checkpoint restore is only implemented on x86_64 and riscv64".into(),
             )
             .into());
         }
